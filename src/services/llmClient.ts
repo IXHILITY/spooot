@@ -22,64 +22,141 @@ export interface MealAnalysisResult {
   comment: string;
 }
 
-function buildCompletionsUrl(baseUrl: string): string {
-  const clean = baseUrl.trim().replace(/\/+$/, '');
-  return clean.endsWith('/chat/completions') ? clean : `${clean}/chat/completions`;
+function isGoogleApiKey(key: string): boolean {
+  return key.trim().startsWith('AIza');
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function getGoogleRootUrl(baseUrl: string): string {
+  const clean = baseUrl.trim().replace(/\/+$/, '');
+  return clean
+    .replace(/\/v1beta\/openai(?:\/chat\/completions)?$/i, '')
+    .replace(/\/chat\/completions$/i, '');
+}
 
-async function callHydrogenCompletions(
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs = 22000
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Прямой нативный вызов Gemini API через твой Cloudflare Worker (быстрый Vision без 524)
+async function callNativeGemini(
+  settings: AppSettings,
+  systemPrompt: string,
+  userParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>,
+  temperature = 0.3
+): Promise<string> {
+  const rootUrl = getGoogleRootUrl(settings.apiBaseUrl);
+  const apiKey = settings.apiKey.trim();
+  const preferred = settings.model.trim() || 'gemini-3.8-flash';
+
+  // Цепочка моделей на случай перегрузки (503/524) или недоступности (404)
+  const candidates = Array.from(
+    new Set([
+      preferred,
+      'gemini-3.8-flash',
+      'gemini-2.5-flash-lite',
+      'gemini-2.0-flash',
+    ])
+  );
+
+  let lastError = 'Сервер Google временно перегружен';
+
+  for (const modelName of candidates) {
+    const cleanModel = modelName.replace(/^models\//, '');
+    const url = `${rootUrl}/v1beta/models/${cleanModel}:generateContent?key=${encodeURIComponent(
+      apiKey
+    )}`;
+
+    try {
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents: [{ role: 'user', parts: userParts }],
+            generationConfig: {
+              temperature,
+              maxOutputTokens: 900,
+            },
+          }),
+        },
+        22000
+      );
+
+      if (res.ok) {
+        const data = await res.json();
+        const text = data?.candidates?.[0]?.content?.parts
+          ?.map((p: { text?: string }) => p.text || '')
+          .join('')
+          .trim();
+        if (text) return text;
+      }
+
+      const errBody = await res.text().catch(() => '');
+      lastError = `HTTP ${res.status}: ${errBody.slice(0, 140)}`;
+
+      // При 503, 524, 429 или 404 сразу пробуем следующую модель из списка
+      if ([404, 429, 500, 502, 503, 524].includes(res.status)) {
+        continue;
+      }
+      break;
+    } catch (err) {
+      lastError = err instanceof Error && err.name === 'AbortError'
+        ? 'Превышено время ожидания (22 сек)'
+        : String(err);
+      continue;
+    }
+  }
+
+  throw new Error(lastError);
+}
+
+// Стандартный OpenAI-совместимый вызов (для сторонних провайдеров)
+async function callOpenAiCompatible(
   settings: AppSettings,
   messages: unknown[],
   temperature = 0.4
 ): Promise<string> {
-  if (!settings.apiKey.trim()) {
-    throw new Error('Не указан API Key. Перейди в «Настройки» и вставь ключ.');
-  }
+  const clean = settings.apiBaseUrl.trim().replace(/\/+$/, '');
+  const endpoint = clean.endsWith('/chat/completions') ? clean : `${clean}/chat/completions`;
 
-  const endpoint = buildCompletionsUrl(settings.apiBaseUrl);
-  const primaryModel = settings.model.trim() || 'gemini-3.8-flash';
-  const maxAttempts = 3;
-  let lastErrorText = '';
-  let lastStatus = 0;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const response = await fetch(endpoint, {
+  const res = await fetchWithTimeout(
+    endpoint,
+    {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${settings.apiKey.trim()}`,
       },
       body: JSON.stringify({
-        model: primaryModel,
+        model: settings.model.trim() || 'hydrogen-4',
         messages,
         temperature,
       }),
-    });
+    },
+    25000
+  );
 
-    if (response.ok) {
-      const data = await response.json();
-      const content: string | undefined = data?.choices?.[0]?.message?.content;
-      if (!content) {
-        throw new Error('Модель вернула пустой ответ.');
-      }
-      return content.trim();
-    }
-
-    lastStatus = response.status;
-    lastErrorText = await response.text().catch(() => response.statusText);
-
-    // Если сервер Google временно перегружен (503 или 429) — ждём и пробуем ещё раз автоматически
-    if ((lastStatus === 503 || lastStatus === 429) && attempt < maxAttempts) {
-      await sleep(1500 * attempt);
-      continue;
-    }
-
-    break;
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Ошибка API (${res.status}): ${errText.slice(0, 160)}`);
   }
 
-  throw new Error(`Ошибка API (${lastStatus}): ${lastErrorText.slice(0, 180)}`);
+  const data = await res.json();
+  const content: string | undefined = data?.choices?.[0]?.message?.content;
+  if (!content) throw new Error('Пустой ответ от модели.');
+  return content.trim();
 }
 
 export const llmClient = {
@@ -88,12 +165,28 @@ export const llmClient = {
     context: CoachContext,
     history: ChatMessage[]
   ): Promise<string> {
+    if (!settings.apiKey.trim()) {
+      throw new Error('Не указан API Key в «Настройках».');
+    }
+
     const systemPrompt = buildCoachSystemPrompt(context);
-    const payloadMessages = [
-      { role: 'system', content: systemPrompt },
-      ...history.slice(-12).map((m) => ({ role: m.role, content: m.content })),
-    ];
-    return callHydrogenCompletions(settings, payloadMessages, 0.45);
+
+    if (isGoogleApiKey(settings.apiKey)) {
+      const dialogText = history
+        .slice(-10)
+        .map((m) => `${m.role === 'user' ? 'Атлет' : 'Тренер'}: ${m.content}`)
+        .join('\n\n');
+      return callNativeGemini(settings, systemPrompt, [{ text: dialogText }], 0.45);
+    }
+
+    return callOpenAiCompatible(
+      settings,
+      [
+        { role: 'system', content: systemPrompt },
+        ...history.slice(-12).map((m) => ({ role: m.role, content: m.content })),
+      ],
+      0.45
+    );
   },
 
   async requestExerciseSwap(
@@ -105,14 +198,21 @@ export const llmClient = {
       elbowStatus: ElbowStatus;
     }
   ): Promise<string> {
+    if (!settings.apiKey.trim()) {
+      throw new Error('Не указан API Key в «Настройках».');
+    }
+
+    const sys = 'Ты — опытный тренер в тренажёрном зале. Отвечай кратко и практично.';
     const prompt = buildSwapExercisePrompt(params);
-    return callHydrogenCompletions(
+
+    if (isGoogleApiKey(settings.apiKey)) {
+      return callNativeGemini(settings, sys, [{ text: prompt }], 0.3);
+    }
+
+    return callOpenAiCompatible(
       settings,
       [
-        {
-          role: 'system',
-          content: 'Ты — опытный тренер в тренажёрном зале. Отвечай кратко и практично.',
-        },
+        { role: 'system', content: sys },
         { role: 'user', content: prompt },
       ],
       0.3
@@ -124,33 +224,43 @@ export const llmClient = {
     compressedBase64DataUrl: string,
     remainingCalories: number
   ): Promise<MealAnalysisResult> {
+    if (!settings.apiKey.trim()) {
+      throw new Error('Не указан API Key в «Настройках».');
+    }
+
     const systemPrompt = buildMealPhotoSystemPrompt(remainingCalories);
+    let rawResponse = '';
 
-    const rawResponse = await callHydrogenCompletions(
-      settings,
-      [
-        { role: 'system', content: systemPrompt },
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: 'Оцени состав, примерный вес порции и КБЖУ этого приёма пищи.',
-            },
-            {
-              type: 'image_url',
-              image_url: { url: compressedBase64DataUrl },
-            },
-          ],
-        },
-      ],
-      0.2
-    );
+    if (isGoogleApiKey(settings.apiKey)) {
+      const base64Clean = compressedBase64DataUrl.replace(/^data:image\/\w+;base64,/, '');
+      rawResponse = await callNativeGemini(
+        settings,
+        systemPrompt,
+        [
+          { text: 'Оцени состав, вес порции и КБЖУ этого блюда. Верни только валидный JSON.' },
+          { inlineData: { mimeType: 'image/jpeg', data: base64Clean } },
+        ],
+        0.2
+      );
+    } else {
+      rawResponse = await callOpenAiCompatible(
+        settings,
+        [
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Оцени состав, вес порции и КБЖУ этого блюда.' },
+              { type: 'image_url', image_url: { url: compressedBase64DataUrl } },
+            ],
+          },
+        ],
+        0.2
+      );
+    }
 
-    const cleanedJson = rawResponse
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```$/i, '')
-      .trim();
+    const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
+    const cleanedJson = jsonMatch ? jsonMatch[0] : rawResponse;
 
     const parsed = JSON.parse(cleanedJson) as Partial<MealAnalysisResult>;
     return {
