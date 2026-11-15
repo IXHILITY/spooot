@@ -29,7 +29,7 @@ const SPLITS: { id: TrainingSplit; label: string }[] = [
   { id: 'LEGS', label: 'LEGS' },
 ];
 
-const MAX_NOTE_LENGTH = 180;
+const MAX_NOTE_LENGTH = 250;
 
 export const ProgramEditor: React.FC<ProgramEditorProps> = ({
   program,
@@ -51,12 +51,6 @@ export const ProgramEditor: React.FC<ProgramEditorProps> = ({
     () => draftProgram.filter((ex) => ex.split === selectedSplit),
     [draftProgram, selectedSplit]
   );
-
-  const cloudBytesUsed = useMemo(
-    () => new TextEncoder().encode(JSON.stringify(draftProgram)).length,
-    [draftProgram]
-  );
-  const isOverCloudLimit = cloudBytesUsed > 4000;
 
   const applyDraftUpdate = (updater: (prev: ExerciseTemplate[]) => ExerciseTemplate[]) => {
     setDraftProgram((prev) => updater(prev));
@@ -147,7 +141,6 @@ export const ProgramEditor: React.FC<ProgramEditorProps> = ({
   };
 
   const handleSaveAll = () => {
-    if (isOverCloudLimit) return;
     const normalized = draftProgram.map((ex) => ({
       ...ex,
       notes: ex.notes?.trim() || undefined,
@@ -189,13 +182,6 @@ export const ProgramEditor: React.FC<ProgramEditorProps> = ({
           );
         })}
       </div>
-
-      {isOverCloudLimit && (
-        <div className="p-3 rounded-xl bg-red-500/15 border border-red-500/30 text-xs text-red-300">
-          Превышен лимит Telegram CloudStorage ({cloudBytesUsed} / 4096 байт). Сократи заметки или
-          удали лишние упражнения перед сохранением.
-        </div>
-      )}
 
       <div className="space-y-2.5">
         {splitExercises.map((ex, index) => {
@@ -476,7 +462,7 @@ export const ProgramEditor: React.FC<ProgramEditorProps> = ({
       <div className="pt-2 space-y-2">
         <button
           type="button"
-          disabled={!hasChanges || isOverCloudLimit}
+          disabled={!hasChanges}
           onClick={handleSaveAll}
           className="w-full py-3 rounded-xl bg-emerald-500 disabled:opacity-40 text-black font-bold text-sm flex items-center justify-center gap-2 transition-opacity"
         >

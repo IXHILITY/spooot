@@ -37,10 +37,30 @@ function readLocal<T>(key: string, fallback: T): T {
   }
 }
 
+// Автоматическое разбиение больших данных на чанки по 1400 символов (< 3000 байт) для обхода лимита 4096 байт в CloudStorage
+async function syncToCloud(key: string, serialized: string): Promise<void> {
+  const byteSize = new TextEncoder().encode(serialized).length;
+  if (byteSize <= 3800) {
+    await cloudSetItem(key, serialized);
+    return;
+  }
+
+  const chunkSize = 1400;
+  const chunks: string[] = [];
+  for (let i = 0; i < serialized.length; i += chunkSize) {
+    chunks.push(serialized.slice(i, i + chunkSize));
+  }
+
+  for (let i = 0; i < chunks.length; i++) {
+    await cloudSetItem(`${key}__c${i}`, chunks[i]);
+  }
+  await cloudSetItem(key, JSON.stringify({ __chunked: true, n: chunks.length }));
+}
+
 function writeHybrid<T>(key: string, data: T): void {
   const serialized = JSON.stringify(data);
   localStorage.setItem(key, serialized);
-  void cloudSetItem(key, serialized);
+  void syncToCloud(key, serialized);
 }
 
 export const storageService = {
@@ -53,9 +73,34 @@ export const storageService = {
 
     let updated = false;
     for (const key of keys) {
-      if (!key.startsWith('tma_')) continue;
-      const cloudVal = await cloudGetItem(key);
-      if (cloudVal && localStorage.getItem(key) !== cloudVal) {
+      if (!key.startsWith('tma_') || key.includes('__c')) continue;
+      let cloudVal = await cloudGetItem(key);
+      if (!cloudVal) continue;
+
+      if (cloudVal.startsWith('{"__chunked":true')) {
+        try {
+          const meta = JSON.parse(cloudVal) as { __chunked: boolean; n: number };
+          const parts: string[] = [];
+          let ok = true;
+          for (let i = 0; i < meta.n; i++) {
+            const part = await cloudGetItem(`${key}__c${i}`);
+            if (part === null) {
+              ok = false;
+              break;
+            }
+            parts.push(part);
+          }
+          if (ok) {
+            cloudVal = parts.join('');
+          } else {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      if (localStorage.getItem(key) !== cloudVal) {
         localStorage.setItem(key, cloudVal);
         updated = true;
       }
