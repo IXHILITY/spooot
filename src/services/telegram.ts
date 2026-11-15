@@ -8,6 +8,7 @@ export function isTelegramEnv(): boolean {
 }
 
 export function initTelegramApp(): void {
+  applyTelegramTheme();
   if (!isTelegramEnv()) return;
   try {
     twa.ready();
@@ -15,7 +16,12 @@ export function initTelegramApp(): void {
     if (typeof twa.disableVerticalSwipes === 'function') {
       twa.disableVerticalSwipes();
     }
-    applyTelegramTheme();
+    if (typeof twa.setHeaderColor === 'function') {
+      twa.setHeaderColor('#0B0E14');
+    }
+    if (typeof twa.setBackgroundColor === 'function') {
+      twa.setBackgroundColor('#0B0E14');
+    }
   } catch (e) {
     console.warn('Telegram WebApp init skipped:', e);
   }
@@ -24,14 +30,12 @@ export function initTelegramApp(): void {
 export function applyTelegramTheme(): void {
   if (typeof document === 'undefined') return;
   const root = document.documentElement;
-  const tp = isTelegramEnv() ? twa.themeParams || {} : {};
-
-  root.style.setProperty('--tg-bg', tp.bg_color || '#0B0E14');
-  root.style.setProperty('--tg-secondary-bg', tp.secondary_bg_color || '#151A23');
-  root.style.setProperty('--tg-text', tp.text_color || '#F3F4F6');
-  root.style.setProperty('--tg-hint', tp.hint_color || '#9CA3AF');
-  root.style.setProperty('--tg-accent', tp.button_color || '#10B981');
-  root.style.setProperty('--tg-accent-text', tp.button_text_color || '#FFFFFF');
+  root.style.setProperty('--tg-bg', '#0B0E14');
+  root.style.setProperty('--tg-secondary-bg', '#151A23');
+  root.style.setProperty('--tg-text', '#F3F4F6');
+  root.style.setProperty('--tg-hint', '#9CA3AF');
+  root.style.setProperty('--tg-accent', '#10B981');
+  root.style.setProperty('--tg-accent-text', '#FFFFFF');
 }
 
 export function getTelegramUserId(): string | null {
@@ -50,9 +54,7 @@ export function triggerHaptic(
     } else {
       twa.HapticFeedback.impactOccurred(type);
     }
-  } catch {
-    // ignore on older desktop clients
-  }
+  } catch {}
 }
 
 export function cloudGetItem(key: string): Promise<string | null> {
@@ -62,11 +64,7 @@ export function cloudGetItem(key: string): Promise<string | null> {
       return;
     }
     twa.CloudStorage.getItem(key, (err: unknown, value?: string) => {
-      if (err) {
-        resolve(null);
-        return;
-      }
-      resolve(value || null);
+      resolve(err ? null : value || null);
     });
   });
 }
@@ -79,16 +77,11 @@ export function cloudSetItem(key: string, value: string): Promise<boolean> {
     }
     const byteSize = new TextEncoder().encode(value).length;
     if (byteSize > MAX_CLOUD_VALUE_BYTES) {
-      console.error(`CloudStorage limit exceeded for [${key}]: ${byteSize} bytes`);
       resolve(false);
       return;
     }
     twa.CloudStorage.setItem(key, value, (err: unknown, stored?: boolean) => {
-      if (err) {
-        resolve(false);
-        return;
-      }
-      resolve(Boolean(stored));
+      resolve(err ? false : Boolean(stored));
     });
   });
 }
@@ -100,11 +93,7 @@ export function cloudGetKeys(): Promise<string[]> {
       return;
     }
     twa.CloudStorage.getKeys((err: unknown, keys?: string[]) => {
-      if (err || !keys) {
-        resolve([]);
-        return;
-      }
-      resolve(keys);
+      resolve(err || !keys ? [] : keys);
     });
   });
 }
