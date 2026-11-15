@@ -22,13 +22,19 @@ export interface MealAnalysisResult {
   comment: string;
 }
 
-function isGoogleApiKey(key: string): boolean {
-  return key.trim().startsWith('AIza');
+function isGoogleOrWorkerEndpoint(settings: AppSettings): boolean {
+  const url = settings.apiBaseUrl.toLowerCase();
+  return (
+    settings.apiKey.trim().startsWith('AIza') ||
+    url.includes('googleapis.com') ||
+    url.includes('workers.dev')
+  );
 }
 
-function getGoogleRootUrl(baseUrl: string): string {
-  const clean = baseUrl.trim().replace(/\/+$/, '');
-  return clean
+function getRootUrl(baseUrl: string): string {
+  return baseUrl
+    .trim()
+    .replace(/\/+$/, '')
     .replace(/\/v1beta\/openai(?:\/chat\/completions)?$/i, '')
     .replace(/\/chat\/completions$/i, '');
 }
@@ -36,43 +42,95 @@ function getGoogleRootUrl(baseUrl: string): string {
 async function fetchWithTimeout(
   url: string,
   options: RequestInit,
-  timeoutMs = 22000
+  timeoutMs = 45000
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Превышено время ожидания ответа от сервера (45 сек). Попробуй ещё раз.');
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
 }
 
-// Прямой нативный вызов Gemini API через твой Cloudflare Worker (быстрый Vision без 524)
+let cachedAvailableModels: string[] | null = null;
+
+// Автоматически узнаём у Google список доступных моделей для твоего ключа
+async function discoverGoogleModels(rootUrl: string, apiKey: string): Promise<string[]> {
+  if (cachedAvailableModels && cachedAvailableModels.length > 0) {
+    return cachedAvailableModels;
+  }
+  try {
+    const res = await fetchWithTimeout(
+      `${rootUrl}/v1beta/models?key=${encodeURIComponent(apiKey)}`,
+      { method: 'GET' },
+      12000
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    const models: string[] = (data?.models || [])
+      .filter(
+        (m: { name?: string; supportedGenerationMethods?: string[] }) =>
+          m.name &&
+          Array.isArray(m.supportedGenerationMethods) &&
+          m.supportedGenerationMethods.includes('generateContent') &&
+          !m.name.includes('tts') &&
+          !m.name.includes('embedding') &&
+          !m.name.includes('imagen') &&
+          !m.name.includes('robotics')
+      )
+      .map((m: { name: string }) => m.name.replace(/^models\//, ''));
+
+    // Ставим быстрые flash-lite и flash модели в начало очереди
+    models.sort((a, b) => {
+      const score = (name: string) => {
+        if (name.includes('flash-lite')) return 1;
+        if (name.includes('2.0-flash')) return 2;
+        if (name.includes('flash')) return 3;
+        return 4;
+      };
+      return score(a) - score(b);
+    });
+
+    if (models.length > 0) {
+      cachedAvailableModels = models;
+    }
+    return models;
+  } catch {
+    return [];
+  }
+}
+
 async function callNativeGemini(
   settings: AppSettings,
   systemPrompt: string,
   userParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>,
   temperature = 0.3
 ): Promise<string> {
-  const rootUrl = getGoogleRootUrl(settings.apiBaseUrl);
+  const rootUrl = getRootUrl(settings.apiBaseUrl);
   const apiKey = settings.apiKey.trim();
-  const preferred = settings.model.trim() || 'gemini-3.8-flash';
+  const preferred = settings.model.trim().replace(/^models\//, '');
 
-  // Цепочка моделей на случай перегрузки (503/524) или недоступности (404)
+  const discovered = await discoverGoogleModels(rootUrl, apiKey);
   const candidates = Array.from(
     new Set([
-      preferred,
-      'gemini-3.8-flash',
-      'gemini-2.5-flash-lite',
-      'gemini-2.0-flash',
+      ...(discovered.includes(preferred) ? [preferred] : []),
+      ...discovered.slice(0, 4),
+      ...(discovered.length === 0
+        ? [preferred || 'gemini-2.0-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash']
+        : []),
     ])
   );
 
-  let lastError = 'Сервер Google временно перегружен';
+  let lastError = 'Не удалось получить ответ от Google AI';
 
   for (const modelName of candidates) {
-    const cleanModel = modelName.replace(/^models\//, '');
-    const url = `${rootUrl}/v1beta/models/${cleanModel}:generateContent?key=${encodeURIComponent(
+    const url = `${rootUrl}/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(
       apiKey
     )}`;
 
@@ -87,11 +145,11 @@ async function callNativeGemini(
             contents: [{ role: 'user', parts: userParts }],
             generationConfig: {
               temperature,
-              maxOutputTokens: 900,
+              maxOutputTokens: 700,
             },
           }),
         },
-        22000
+        40000
       );
 
       if (res.ok) {
@@ -104,17 +162,14 @@ async function callNativeGemini(
       }
 
       const errBody = await res.text().catch(() => '');
-      lastError = `HTTP ${res.status}: ${errBody.slice(0, 140)}`;
+      lastError = `HTTP ${res.status} (${modelName}): ${errBody.slice(0, 140)}`;
 
-      // При 503, 524, 429 или 404 сразу пробуем следующую модель из списка
-      if ([404, 429, 500, 502, 503, 524].includes(res.status)) {
+      if ([400, 404, 429, 500, 502, 503, 524].includes(res.status)) {
         continue;
       }
       break;
     } catch (err) {
-      lastError = err instanceof Error && err.name === 'AbortError'
-        ? 'Превышено время ожидания (22 сек)'
-        : String(err);
+      lastError = err instanceof Error ? err.message : String(err);
       continue;
     }
   }
@@ -122,7 +177,6 @@ async function callNativeGemini(
   throw new Error(lastError);
 }
 
-// Стандартный OpenAI-совместимый вызов (для сторонних провайдеров)
 async function callOpenAiCompatible(
   settings: AppSettings,
   messages: unknown[],
@@ -145,7 +199,7 @@ async function callOpenAiCompatible(
         temperature,
       }),
     },
-    25000
+    45000
   );
 
   if (!res.ok) {
@@ -171,7 +225,7 @@ export const llmClient = {
 
     const systemPrompt = buildCoachSystemPrompt(context);
 
-    if (isGoogleApiKey(settings.apiKey)) {
+    if (isGoogleOrWorkerEndpoint(settings)) {
       const dialogText = history
         .slice(-10)
         .map((m) => `${m.role === 'user' ? 'Атлет' : 'Тренер'}: ${m.content}`)
@@ -205,7 +259,7 @@ export const llmClient = {
     const sys = 'Ты — опытный тренер в тренажёрном зале. Отвечай кратко и практично.';
     const prompt = buildSwapExercisePrompt(params);
 
-    if (isGoogleApiKey(settings.apiKey)) {
+    if (isGoogleOrWorkerEndpoint(settings)) {
       return callNativeGemini(settings, sys, [{ text: prompt }], 0.3);
     }
 
@@ -231,13 +285,13 @@ export const llmClient = {
     const systemPrompt = buildMealPhotoSystemPrompt(remainingCalories);
     let rawResponse = '';
 
-    if (isGoogleApiKey(settings.apiKey)) {
+    if (isGoogleOrWorkerEndpoint(settings)) {
       const base64Clean = compressedBase64DataUrl.replace(/^data:image\/\w+;base64,/, '');
       rawResponse = await callNativeGemini(
         settings,
         systemPrompt,
         [
-          { text: 'Оцени состав, вес порции и КБЖУ этого блюда. Верни только валидный JSON.' },
+          { text: 'Оцени КБЖУ блюда на фото и верни только JSON.' },
           { inlineData: { mimeType: 'image/jpeg', data: base64Clean } },
         ],
         0.2
@@ -250,7 +304,7 @@ export const llmClient = {
           {
             role: 'user',
             content: [
-              { type: 'text', text: 'Оцени состав, вес порции и КБЖУ этого блюда.' },
+              { type: 'text', text: 'Оцени КБЖУ блюда на фото.' },
               { type: 'image_url', image_url: { url: compressedBase64DataUrl } },
             ],
           },
