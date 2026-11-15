@@ -27,40 +27,59 @@ function buildCompletionsUrl(baseUrl: string): string {
   return clean.endsWith('/chat/completions') ? clean : `${clean}/chat/completions`;
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function callHydrogenCompletions(
   settings: AppSettings,
   messages: unknown[],
   temperature = 0.4
 ): Promise<string> {
   if (!settings.apiKey.trim()) {
-    throw new Error('Не указан API Key. Перейди в «Настройки» и вставь ключ для hydrogen-4.');
+    throw new Error('Не указан API Key. Перейди в «Настройки» и вставь ключ.');
   }
 
   const endpoint = buildCompletionsUrl(settings.apiBaseUrl);
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${settings.apiKey.trim()}`,
-    },
-    body: JSON.stringify({
-      model: settings.model.trim() || 'hydrogen-4',
-      messages,
-      temperature,
-    }),
-  });
+  const primaryModel = settings.model.trim() || 'gemini-3.8-flash';
+  const maxAttempts = 3;
+  let lastErrorText = '';
+  let lastStatus = 0;
 
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`Ошибка API (${response.status}): ${errText.slice(0, 180) || response.statusText}`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${settings.apiKey.trim()}`,
+      },
+      body: JSON.stringify({
+        model: primaryModel,
+        messages,
+        temperature,
+      }),
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      const content: string | undefined = data?.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error('Модель вернула пустой ответ.');
+      }
+      return content.trim();
+    }
+
+    lastStatus = response.status;
+    lastErrorText = await response.text().catch(() => response.statusText);
+
+    // Если сервер Google временно перегружен (503 или 429) — ждём и пробуем ещё раз автоматически
+    if ((lastStatus === 503 || lastStatus === 429) && attempt < maxAttempts) {
+      await sleep(1500 * attempt);
+      continue;
+    }
+
+    break;
   }
 
-  const data = await response.json();
-  const content: string | undefined = data?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('Модель вернула пустой ответ.');
-  }
-  return content.trim();
+  throw new Error(`Ошибка API (${lastStatus}): ${lastErrorText.slice(0, 180)}`);
 }
 
 export const llmClient = {
